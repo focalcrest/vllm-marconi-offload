@@ -66,11 +66,29 @@ elif PATCH_STATUS.startswith("skipped"):
 
 # --- Stage 2: import the connector and register it with the factory ---
 
-# Re-exported for direct `from vllm_marconi_offload import SimpleCPUOffloadConnector`.
-from vllm_marconi_offload.connector import SimpleCPUOffloadConnector  # noqa: E402
+# Try to expose the connector class for direct `from vllm_marconi_offload
+# import SimpleCPUOffloadConnector`. The connector module pulls in
+# ``vllm.*`` at import time, so without vLLM installed we skip this
+# step and leave the symbol unbound. Tools like dependency scanners or
+# pre-install package indexes can still load the bare package.
+SimpleCPUOffloadConnector = None  # type: ignore[assignment]
+
+try:
+    from vllm_marconi_offload.connector import (  # noqa: E402
+        SimpleCPUOffloadConnector,
+    )
+except Exception as exc:  # pragma: no cover - env-dependent
+    _logger.warning(
+        "vllm_marconi_offload: SimpleCPUOffloadConnector could not be "
+        "imported (%s: %s). Install vLLM to enable the connector.",
+        type(exc).__name__,
+        exc,
+    )
 
 
 def _register() -> None:
+    if SimpleCPUOffloadConnector is None:
+        return
     try:
         from vllm.distributed.kv_transfer.kv_connector.factory import (
             KVConnectorFactory,
