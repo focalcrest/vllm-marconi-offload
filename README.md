@@ -144,7 +144,7 @@ no observable effect.
 
 | `vllm-marconi-offload` | Tested vLLM versions | Notes |
 |:-----------------------|:---------------------|:------|
-| `0.1.x`                | `0.7.x` `0.8.x`      | Initial release. Hybrid-model patch enabled. |
+| `0.1.x`                | `0.20.x`             | Initial release. Lineage matches the SM70 V100 fork (`0.20.1.devNN`). The AST matcher should also work on adjacent versions that still ship `Scheduler._mamba_block_aligned_split` with the same guard, but only `0.20.x` is verified. |
 
 When vLLM ships an incompatible refactor of `Scheduler._mamba_block_aligned_split`,
 we publish a new release with an updated AST matcher and bump the matrix.

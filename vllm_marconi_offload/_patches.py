@@ -41,6 +41,24 @@ __all__ = ["maybe_patch_hybrid_scheduler", "PATCH_STATUS"]
 PATCH_STATUS: str = "pending"
 
 
+# Upstream's assert message — checked at bytecode level for idempotency
+# when ``inspect.getsource`` is unavailable (e.g. on a method we already
+# patched, since exec-compiled functions have no on-disk source).
+_ASSERT_MESSAGE = "External KV connector is not verified yet"
+
+
+def _has_assert_message_const(method) -> bool:
+    """True if the method's bytecode embeds the upstream assert's message."""
+    code = getattr(method, "__code__", None)
+    if code is None:
+        return True  # be conservative: report "still maybe present"
+    return any(
+        isinstance(c, str) and _ASSERT_MESSAGE in c
+        for c in code.co_consts
+        if c is not None
+    )
+
+
 def _matches_external_computed_tokens_assert(node: ast.stmt) -> bool:
     if not isinstance(node, ast.Assert):
         return False
@@ -81,7 +99,15 @@ def maybe_patch_hybrid_scheduler() -> str:
     try:
         src = textwrap.dedent(inspect.getsource(method))
     except (OSError, TypeError) as exc:
-        PATCH_STATUS = f"skipped-no-source:{type(exc).__name__}"
+        # No on-disk source — most commonly because the method has
+        # already been replaced via ``exec`` (likely by an earlier import
+        # of this module). Fall back to bytecode introspection: if the
+        # method's co_consts no longer contains the upstream assert's
+        # message string, treat the patch as already-in-place.
+        if not _has_assert_message_const(method):
+            PATCH_STATUS = "not-needed"
+        else:
+            PATCH_STATUS = f"skipped-no-source:{type(exc).__name__}"
         return PATCH_STATUS
 
     try:
