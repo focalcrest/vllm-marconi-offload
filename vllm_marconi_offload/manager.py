@@ -3,7 +3,11 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import hashlib
+import json
 import math
+import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -283,6 +287,8 @@ class SimpleCPUOffloadScheduler:
         vllm_config: VllmConfig,
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
+        scheduler_block_size: int,
+        hash_block_size: int,
         lazy_offload: bool = False,
     ):
         self.vllm_config = vllm_config
@@ -291,8 +297,9 @@ class SimpleCPUOffloadScheduler:
             vllm_config.kv_events_config is not None
             and vllm_config.kv_events_config.enable_kv_cache_events
         )
-        # NOTE: We use the same block size for both GPU and CPU.
-        self.block_size = vllm_config.cache_config.block_size
+        self.block_size = scheduler_block_size
+        self.hash_block_size = hash_block_size
+        assert self.block_size % self.hash_block_size == 0
         # Derive a CPU KVCacheConfig from the GPU config and build a coordinator
         assert kv_cache_config is not None
         self.cpu_kv_cache_config = self._derive_cpu_config(
@@ -306,6 +313,12 @@ class SimpleCPUOffloadScheduler:
                 self.fa_gidx = g_idx
                 break
         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
+        # FA group's own block_size; divides scheduler_block_size (the LCM)
+        # but is NOT assumed to equal it.
+        self.fa_block_size: int = self.cpu_kv_cache_config.kv_cache_groups[
+            self.fa_gidx
+        ].kv_cache_spec.block_size
+        assert self.block_size % self.fa_block_size == 0
 
         logger.info(
             "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s)",
@@ -321,12 +334,16 @@ class SimpleCPUOffloadScheduler:
         self.cpu_coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
             kv_cache_config=self.cpu_kv_cache_config,
             max_model_len=vllm_config.model_config.max_model_len,
+            max_num_batched_tokens=(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            ),
             use_eagle=False,
             enable_caching=True,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
-            hash_block_size=self.block_size,
+            scheduler_block_size=self.block_size,
+            hash_block_size=self.hash_block_size,
         )
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
 
@@ -412,7 +429,9 @@ class SimpleCPUOffloadScheduler:
         l2_capacity_bytes = l2_bytes_total // max(
             1, vllm_config.parallel_config.world_size
         )
-        l2_pool_path_present = bool(extra_cfg.get("l2_pool_path"))
+        self._l2_pool_path: str | None = extra_cfg.get("l2_pool_path")
+        self._l2_capacity_bytes: int = l2_capacity_bytes
+        l2_pool_path_present = bool(self._l2_pool_path)
         self._dual_tier: bool = l2_capacity_bytes > 0 and l2_pool_path_present
         self.l2_kv_cache_config: KVCacheConfig | None = None
         self.l2_coordinator: KVCacheCoordinator | None = None
@@ -426,11 +445,15 @@ class SimpleCPUOffloadScheduler:
             self.l2_coordinator = get_kv_cache_coordinator(
                 kv_cache_config=self.l2_kv_cache_config,
                 max_model_len=vllm_config.model_config.max_model_len,
+                max_num_batched_tokens=(
+                    vllm_config.scheduler_config.max_num_batched_tokens
+                ),
                 use_eagle=False,
                 enable_caching=True,
                 enable_kv_cache_events=False,  # L2 is internal; no events
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
+                scheduler_block_size=self.block_size,
                 hash_block_size=self.block_size,
             )
             self.l2_block_pool = self.l2_coordinator.block_pool
@@ -496,6 +519,272 @@ class SimpleCPUOffloadScheduler:
                 eviction_reuse_mode,
             )
 
+        # Cross-restart L2 persistence. The L2 mmap files themselves
+        # already survive a restart (worker.py gives L2 a config-derived
+        # stable filename instead of L1's random per-launch one); what's
+        # rebuilt here is the in-memory hash->block_id index that a fresh
+        # process has no way to recover on its own. Only meaningful with
+        # Marconi (need per-block depth/step to restore), dual-tier L2,
+        # and a configured pool path.
+        self._manifest_save_interval: float = float(
+            extra_cfg.get("l2_manifest_save_interval_s", 30.0)
+        )
+        self._last_manifest_save_ts: float = 0.0
+        # Periodic non-evicting L1->L2 mirror. Without this, a hash only
+        # ever reaches L2 by being evicted from L1 under memory pressure --
+        # so the *hottest* data (still resident in L1, which the connector
+        # wipes every restart) is exactly what a restart loses, while
+        # colder, already-demoted data survives. This periodically copies
+        # L1's current residents into L2 as well, without dropping them
+        # from L1, so a restart's manifest replay covers the live working
+        # set, not just the demoted tail. Bounded per tick so a large L1
+        # backlog doesn't stall a scheduler step.
+        self._mirror_batch_size: int = int(
+            extra_cfg.get("l2_mirror_batch_size", 64)
+        )
+        if (
+            self._dual_tier
+            and self._eviction_policy is not None
+            and self._l2_pool_path
+        ):
+            self._load_and_replay_l2_manifest()
+
+    def _l2_manifest_path(self) -> str | None:
+        if not self._l2_pool_path:
+            return None
+        return os.path.join(self._l2_pool_path, ".marconi_l2_manifest.json")
+
+    def _compute_manifest_fingerprint(self) -> str:
+        """Config fingerprint gating manifest reuse — must match the L2
+        mmap filename's own fingerprint in spirit (worker.py's
+        _compute_l2_stable_id): same model/topology/L2-size reuses the
+        manifest, anything else starts fresh rather than risk replaying an
+        index that doesn't match what's actually in the mmap file.
+        """
+        model_name = getattr(self.vllm_config.model_config, "model", "unknown")
+        world_size = self.vllm_config.parallel_config.world_size
+        fingerprint_src = (
+            f"{model_name}|{world_size}|{self._l2_capacity_bytes}|"
+            f"{self.num_l2_blocks}|{self.block_size}|{self.hash_block_size}"
+        )
+        return hashlib.sha256(fingerprint_src.encode()).hexdigest()[:16]
+
+    def _save_l2_manifest(self) -> None:
+        """Best-effort periodic checkpoint of the L2 hash->block index.
+        Never raises — a failed checkpoint should degrade to "lose a bit
+        of persisted state," not crash the serving loop.
+        """
+        path = self._l2_manifest_path()
+        if path is None or self._eviction_policy is None or self.l2_block_pool is None:
+            return
+        try:
+            # NOTE: eviction_policy.metadata's own `bhash` field is the
+            # *group-stripped* raw hash (see the admission-tracker comment
+            # at the record_store() call site in _prepare_eager_store_specs)
+            # — it exists only so the reuse-count lookup keys identically
+            # across kv-cache groups. It is NOT the real cache key: the
+            # actual key `get_cached_block()` looks up is the group-packed
+            # `BlockHashWithGroupId` living on the block itself. Read that
+            # directly off the block, or replay would insert under a hash
+            # no real lookup ever queries.
+            l2_blocks = self.l2_block_pool.blocks
+            blocks = []
+            for (tier, block_id), (depth, step, _raw_bhash) in (
+                self._eviction_policy.metadata.items()
+            ):
+                if tier != "l2":
+                    continue
+                real_hash = l2_blocks[block_id].block_hash
+                if real_hash is None:
+                    continue
+                blocks.append(
+                    {
+                        "block_id": block_id,
+                        "hash": bytes(real_hash).hex(),
+                        "depth": depth,
+                        "step": step,
+                    }
+                )
+            manifest = {
+                "version": 1,
+                "fingerprint": self._compute_manifest_fingerprint(),
+                "num_l2_blocks": self.num_l2_blocks,
+                "blocks": blocks,
+            }
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f)
+            os.replace(tmp_path, path)
+        except Exception:
+            logger.warning(
+                "SimpleCPUOffloadScheduler: failed to save L2 manifest at %s",
+                path, exc_info=True,
+            )
+
+    def _maybe_checkpoint_l2_manifest(self) -> None:
+        """Called from the per-step tick — cheap check every step, but
+        only actually runs every ``_manifest_save_interval`` seconds.
+
+        Order matters: mirror L1's current hot set into L2 *before*
+        snapshotting the manifest, so the manifest captures the freshly
+        widened L2 state rather than lagging it by one interval.
+        """
+        if not self._dual_tier or self._eviction_policy is None:
+            return
+        now = time.time()
+        if now - self._last_manifest_save_ts < self._manifest_save_interval:
+            return
+        self._last_manifest_save_ts = now
+        self._mirror_l1_to_l2()
+        self._save_l2_manifest()
+
+    def _mirror_l1_to_l2(self) -> None:
+        """Copy up to ``_mirror_batch_size`` currently-hashed L1 blocks
+        into L2 without evicting them from L1.
+
+        L1 keeps serving them at full speed; L2 now also has a durable
+        byte-identical copy (block content is immutable once hashed, so a
+        stale L2 copy is never a concern) that survives past this
+        process's lifetime. Skips any hash already present in L2.
+        """
+        if (
+            not self._dual_tier
+            or self.l2_block_pool is None
+            or self._eviction_policy is None
+        ):
+            return
+        candidates: list[tuple["KVCacheBlock", int, bytes | None]] = []
+        for l1_blk in self.cpu_block_pool.blocks:
+            if len(candidates) >= self._mirror_batch_size:
+                break
+            bhash = l1_blk.block_hash
+            if bhash is None:
+                continue
+            if (
+                self.l2_block_pool.cached_block_hash_to_block.get_one_block(
+                    bhash
+                )
+                is not None
+            ):
+                continue  # already mirrored
+            meta = self._eviction_policy.metadata.get(("l1", l1_blk.block_id))
+            if meta is None:
+                continue
+            depth, _step, raw_bhash = meta
+            candidates.append((l1_blk, depth, raw_bhash))
+
+        if not candidates:
+            return
+
+        self._hoist_victims_to_head(
+            len(candidates), tier="l2", block_pool=self.l2_block_pool,
+        )
+        l2_free = self.l2_block_pool.get_num_free_blocks()
+        if l2_free < len(candidates):
+            candidates = candidates[:l2_free]
+            if not candidates:
+                return
+
+        l2_blocks = self.l2_block_pool.get_new_blocks(len(candidates))
+        pairs: list[tuple[int, int]] = []
+        for (l1_blk, depth, raw_bhash), l2_blk in zip(candidates, l2_blocks):
+            bhash = l1_blk.block_hash
+            if bhash is None:
+                self.l2_block_pool.free_blocks([l2_blk])
+                continue
+            l2_blk._block_hash = bhash  # type: ignore[assignment]
+            self.l2_block_pool.cached_block_hash_to_block.insert(bhash, l2_blk)
+            self._eviction_policy.record_store(
+                l2_blk.block_id, depth, raw_bhash, tier="l2"
+            )
+            pairs.append((l1_blk.block_id, l2_blk.block_id))
+            self.l2_block_pool.free_blocks([l2_blk])
+
+        if pairs:
+            # Same worker-side primitive the live demote path uses (a
+            # plain L1->L2 memcpy); the only difference is we don't touch
+            # L1's own registration afterward, so it keeps serving.
+            self._pending_demote_pairs.extend(pairs)
+            logger.info(
+                "SimpleCPUOffloadScheduler: mirrored %d hot L1 block(s) "
+                "into L2 (non-evicting).", len(pairs),
+            )
+
+    def _load_and_replay_l2_manifest(self) -> None:
+        """Rebuild the L2 hash->block_id index from a prior run's
+        checkpoint, if one exists and matches this run's config.
+
+        Replays via the exact same primitives the live demote-to-L2 path
+        already uses (get_new_blocks + cached_block_hash_to_block.insert
+        + record_store), not a hand-rolled reconstruction of BlockPool
+        internals. Relies on FreeKVCacheBlockQueue handing out blocks in
+        ascending block_id order on a freshly-initialized pool (true for
+        both the original run and this replay), so replaying manifest
+        entries in block_id order reproduces the original block_id->hash
+        assignment exactly. Aborts (leaving L2 logically empty) at the
+        first sign the assumption doesn't hold, rather than risk mapping
+        a hash to the wrong physical slot.
+        """
+        assert self.l2_block_pool is not None
+        assert self._eviction_policy is not None
+        path = self._l2_manifest_path()
+        if path is None or not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                manifest = json.load(f)
+            if manifest.get("version") != 1:
+                logger.info(
+                    "SimpleCPUOffloadScheduler: L2 manifest at %s has an "
+                    "unrecognized version; starting L2 empty.", path,
+                )
+                return
+            if manifest.get("fingerprint") != self._compute_manifest_fingerprint():
+                logger.info(
+                    "SimpleCPUOffloadScheduler: L2 manifest at %s doesn't "
+                    "match this run's config (model/topology/L2 size "
+                    "changed); starting L2 empty rather than risk a "
+                    "mismatched replay.", path,
+                )
+                return
+            entries = sorted(
+                manifest.get("blocks", []), key=lambda e: e["block_id"]
+            )
+        except Exception:
+            logger.warning(
+                "SimpleCPUOffloadScheduler: failed to read L2 manifest at "
+                "%s; starting L2 empty.", path, exc_info=True,
+            )
+            return
+
+        replayed = 0
+        for entry in entries:
+            l2_blk = self.l2_block_pool.get_new_blocks(1)[0]
+            if l2_blk.block_id != entry["block_id"]:
+                logger.warning(
+                    "SimpleCPUOffloadScheduler: L2 manifest replay "
+                    "block_id mismatch (expected %d, got %d) after %d "
+                    "entries; aborting replay, remaining L2 blocks start "
+                    "empty.", entry["block_id"], l2_blk.block_id, replayed,
+                )
+                self.l2_block_pool.free_blocks([l2_blk])
+                break
+            bhash = bytes.fromhex(entry["hash"])
+            l2_blk._block_hash = bhash  # type: ignore[assignment]
+            self.l2_block_pool.cached_block_hash_to_block.insert(bhash, l2_blk)
+            self._eviction_policy.record_store(
+                l2_blk.block_id, entry["depth"], bhash, tier="l2"
+            )
+            self.l2_block_pool.free_blocks([l2_blk])
+            replayed += 1
+
+        if replayed:
+            logger.info(
+                "SimpleCPUOffloadScheduler: replayed %d/%d L2 blocks from "
+                "prior run's manifest at %s.",
+                replayed, len(entries), path,
+            )
+
     @staticmethod
     def _derive_cpu_config(
         gpu_config: "KVCacheConfig", cpu_capacity_bytes: int
@@ -552,7 +841,7 @@ class SimpleCPUOffloadScheduler:
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         """Return (num_new_tokens, is_async) from consecutive CPU cache hits."""
-        skipped = num_computed_tokens // self.block_size
+        skipped = num_computed_tokens // self.hash_block_size
         remaining_hashes = request.block_hashes[skipped:]
 
         # Marconi admission observation. Every block
@@ -1063,25 +1352,56 @@ class SimpleCPUOffloadScheduler:
         if not victims:
             return []
 
+        policy = self._eviction_policy
+        pairs: list[tuple[int, int]] = []
+
+        # A victim whose hash was already copied into L2 by the periodic
+        # non-evicting mirror pass already has a durable, byte-identical
+        # L2 copy (block content is immutable once hashed) -- no new L2
+        # slot or memcpy needed, just drop L1's side of the registration.
+        already_mirrored = []
+        needs_l2_slot = []
+        for l1_blk in victims:
+            bhash = l1_blk.block_hash
+            if bhash is not None and (
+                self.l2_block_pool.cached_block_hash_to_block.get_one_block(
+                    bhash
+                )
+                is not None
+            ):
+                already_mirrored.append(l1_blk)
+            else:
+                needs_l2_slot.append(l1_blk)
+
+        for l1_blk in already_mirrored:
+            bhash = l1_blk.block_hash
+            self.cpu_block_pool.cached_block_hash_to_block.pop(
+                bhash, l1_blk.block_id
+            )
+            l1_blk.reset_hash()
+            if policy is not None:
+                policy.forget(l1_blk.block_id, tier="l1")
+
+        if not needs_l2_slot:
+            return pairs
+
         # Make room in L2 via its own Marconi-hoisted eviction. If L2 is
         # tight, hoist worst L2 blocks to head; get_new_blocks drops them.
         self._hoist_victims_to_head(
-            len(victims),
+            len(needs_l2_slot),
             tier="l2",
             block_pool=self.l2_block_pool,
         )
-        # If L2 free queue can't satisfy len(victims), demote as many as
-        # fit. The overflow falls back to the normal L1 drop path.
+        # If L2 free queue can't satisfy len(needs_l2_slot), demote as
+        # many as fit. The overflow falls back to the normal L1 drop path.
         l2_free = self.l2_block_pool.get_num_free_blocks()
-        if l2_free < len(victims):
-            victims = victims[:l2_free]
-            if not victims:
-                return []
+        if l2_free < len(needs_l2_slot):
+            needs_l2_slot = needs_l2_slot[:l2_free]
+            if not needs_l2_slot:
+                return pairs
 
-        l2_blocks = self.l2_block_pool.get_new_blocks(len(victims))
-        pairs: list[tuple[int, int]] = []
-        policy = self._eviction_policy
-        for l1_blk, l2_blk in zip(victims, l2_blocks):
+        l2_blocks = self.l2_block_pool.get_new_blocks(len(needs_l2_slot))
+        for l1_blk, l2_blk in zip(needs_l2_slot, l2_blocks):
             bhash = l1_blk.block_hash
             if bhash is None:
                 # Race / unexpected: skip cleanly.
@@ -1209,6 +1529,21 @@ class SimpleCPUOffloadScheduler:
                 self._eviction_policy.forget(l2_block.block_id, tier="l2")
             return existing_l1
 
+        # BUGFIX (2026-07-05, ported from the SM70 in-tree fork):
+        # _demote_l1_victims_for_admission() below can itself allocate NEW
+        # L2 slots via its own hoist+get_new_blocks (to relocate an L1
+        # victim into L2). l2_block is still fully live in L2's free queue
+        # and hash map at this point -- untouched, ref_cnt=0 -- so that
+        # nested call's own victim search could select this EXACT block,
+        # silently repurposing its hash/bytes for unrelated content while
+        # this function still believes it owns them. That's a
+        # data-corrupting race, not just a rare edge case. touch() removes
+        # it from the free queue for the duration; free_blocks() below
+        # returns it once we're done, mirroring the pattern
+        # _demote_l1_victims_for_admission itself already uses for the L2
+        # blocks it stamps.
+        self.l2_block_pool.touch([l2_block])
+
         # Make room in L1: hoist and possibly demote the L1 victim to L2.
         self._hoist_victims_to_head(1)
         demoted = self._demote_l1_victims_for_admission(1)
@@ -1218,6 +1553,7 @@ class SimpleCPUOffloadScheduler:
         # Allocate one L1 slot. May still drop an L1 victim's hash if L2
         # was full and the demote helper couldn't relocate it.
         if self.cpu_block_pool.get_num_free_blocks() <= 0:
+            self.l2_block_pool.free_blocks([l2_block])
             return None
         l1_blocks = self.cpu_block_pool.get_new_blocks(1)
         l1_block = l1_blocks[0]
@@ -1238,6 +1574,7 @@ class SimpleCPUOffloadScheduler:
         self._pending_promote_pairs.append(
             (l2_block.block_id, l1_block.block_id)
         )
+        self.l2_block_pool.free_blocks([l2_block])
         return l1_block
 
     def _prepare_eager_store_specs(
@@ -1261,6 +1598,7 @@ class SimpleCPUOffloadScheduler:
         # tick step counter for age-based decay.
         if self._eviction_policy is not None:
             self._eviction_policy.tick()
+            self._maybe_checkpoint_l2_manifest()
 
         merged_gpu_block_ids: list[int] = []
         merged_cpu_block_ids: list[int] = []
@@ -1310,6 +1648,8 @@ class SimpleCPUOffloadScheduler:
             # Confirmed tokens: KV data written and visible to all streams.
             req = state.request
             confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
+            # Cap to blocks with confirmed KV data.
+            aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 
             for g in range(num_groups):
                 # FIXME (yifan): handle CPU cache eviction, where
@@ -1318,9 +1658,8 @@ class SimpleCPUOffloadScheduler:
                 already_stored_g = state.num_stored_blocks[g]
                 group_gpu_ids = block_ids_by_group[g]
 
-                # Cap to blocks with confirmed KV data.
                 g_block_size = kv_cache_groups[g].kv_cache_spec.block_size
-                ready_blocks_g = confirmed_tokens // g_block_size
+                ready_blocks_g = aligned_tokens // g_block_size
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
                 for i, gpu_block_id in enumerate(scannable):

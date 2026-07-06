@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import hashlib
 import mmap
 import os
 from typing import TYPE_CHECKING
@@ -221,12 +222,16 @@ class SimpleCPUOffloadWorker:
             total_bytes_per_block=total_bytes_per_block,
             pin_memory=pin_memory,
             mmap_handles_target=self._mmap_handles,
+            mmap_id=self._mmap_eng_id_short,
         )
 
         # Allocate L2 pool if configured. L2 is mmap-only by design — its
         # whole point is SSD spillover. We refuse a pinned-host L2 because
         # the math doesn't work (would defeat the RAM budget).
         if l2_pool_path and l2_bytes_to_use > 0:
+            l2_stable_id = self._compute_l2_stable_id(
+                l2_bytes_to_use, total_bytes_per_block
+            )
             self.l2_kv_caches, self.num_l2_blocks = self._allocate_pool(
                 tier_label="l2",
                 pool_path=l2_pool_path,
@@ -235,6 +240,7 @@ class SimpleCPUOffloadWorker:
                 total_bytes_per_block=total_bytes_per_block,
                 pin_memory=False,  # L2 must be mmap-backed; never pin
                 mmap_handles_target=self._l2_mmap_handles,
+                mmap_id=l2_stable_id,
             )
             logger.info(
                 "SimpleCPUOffloadWorker: L2 tier allocated at %s, "
@@ -260,6 +266,27 @@ class SimpleCPUOffloadWorker:
             self.store_stream,
         )
 
+    def _compute_l2_stable_id(
+        self, l2_bytes_to_use: int, total_bytes_per_block: int
+    ) -> str:
+        """Deterministic fingerprint for L2 mmap filenames (cross-restart
+        persistence). Unlike L1's random per-launch engine_id, L2's
+        identifier must stay STABLE across restarts of the same model/
+        topology/L2-config, so a fresh process reopens the same physical
+        file instead of orphaning the previous run's data on every
+        restart — but it must also change when the config changes, so an
+        incompatible restart doesn't silently read garbage from a
+        mismatched old file (the manifest's own config-fingerprint check
+        in manager.py is the second line of defense for that).
+        """
+        model_name = getattr(self.vllm_config.model_config, "model", "unknown")
+        world_size = self.vllm_config.parallel_config.world_size
+        fingerprint_src = (
+            f"{model_name}|{world_size}|{l2_bytes_to_use}|"
+            f"{total_bytes_per_block}"
+        )
+        return hashlib.sha256(fingerprint_src.encode()).hexdigest()[:12]
+
     def _allocate_pool(
         self,
         tier_label: str,
@@ -269,14 +296,22 @@ class SimpleCPUOffloadWorker:
         total_bytes_per_block: int,
         pin_memory: bool,
         mmap_handles_target: list[mmap.mmap],
+        mmap_id: str,
     ) -> tuple[dict[str, torch.Tensor], int]:
         """Allocate one tier of CPU KV mirror tensors.
 
-        : factored out of register_kv_caches so we
-        can call it once for L1 (`/dev/shm`) and once for L2 (`/kvcache`).
+        Factored out of register_kv_caches so we can call it once for L1
+        (`/dev/shm`) and once for L2 (`/kvcache`).
 
         ``tier_label`` ("l1" / "l2") becomes part of the mmap file name so
         the two tiers don't collide on disk when sharing a directory.
+
+        ``mmap_id`` becomes part of the mmap file name too — L1 passes the
+        random per-launch engine_id (fine, L1 is wiped every restart
+        anyway), L2 passes a deterministic config fingerprint instead (see
+        ``_compute_l2_stable_id``) so a restart with unchanged model/
+        topology/L2-size reopens the same physical file instead of
+        creating an orphaned new one every time.
 
         Returns ``(cpu_caches_dict, num_blocks)``.
         """
@@ -287,9 +322,9 @@ class SimpleCPUOffloadWorker:
             rank = self.device.index if self.device is not None else 0
             logger.info(
                 "SimpleCPUOffloadWorker: %s mmap pool at %s "
-                "(engine=%s rank=%d, num_blocks=%d)",
+                "(id=%s rank=%d, num_blocks=%d)",
                 tier_label.upper(), pool_path,
-                self._mmap_eng_id_short, rank, num_blocks,
+                mmap_id, rank, num_blocks,
             )
 
         cpu_caches: dict[str, torch.Tensor] = {}
@@ -300,7 +335,7 @@ class SimpleCPUOffloadWorker:
                 rank = self.device.index if self.device is not None else 0
                 file_path = os.path.join(
                     pool_path,
-                    f"eng{self._mmap_eng_id_short}_r{rank}_"
+                    f"id{mmap_id}_r{rank}_"
                     f"{tier_label}_{safe_name}.bin",
                 )
                 total_bytes = (
