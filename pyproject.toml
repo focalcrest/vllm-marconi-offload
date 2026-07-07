@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-marconi-offload"
-version = "0.1.0"
+version = "0.2.0"
 description = "Two-tier (RAM + SSD) KV cache offload connector for vLLM with Marconi-style reuse-aware eviction."
 readme = "README.md"
 requires-python = ">=3.9"
