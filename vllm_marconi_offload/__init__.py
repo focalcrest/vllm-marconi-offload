@@ -34,6 +34,7 @@ README for design notes and tuning advice.
 from __future__ import annotations
 
 import logging
+import os
 
 from vllm_marconi_offload._patches import maybe_patch_hybrid_scheduler
 
@@ -45,6 +46,27 @@ __all__ = [
 ]
 
 _logger = logging.getLogger("vllm_marconi_offload")
+
+# vLLM's own dictConfig (vllm/logger.py) only attaches a handler to the
+# exact "vllm" logger name — "vllm_marconi_offload" is a separate
+# top-level namespace (not a "vllm.*" child) despite using vLLM's
+# init_logger() helper in submodules like manager.py, so it never
+# inherits that handler and silently drops everything below WARNING via
+# Python's no-op root logger. Attach our own handler so INFO-level
+# messages (patch status, connector registration, L2 manifest replay,
+# etc.) actually surface instead of vanishing. Also needed when this
+# package is imported standalone (without vLLM installed).
+if not _logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter(
+            "%(levelname)s %(asctime)s [%(name)s] %(message)s",
+            datefmt="%m-%d %H:%M:%S",
+        )
+    )
+    _logger.addHandler(_handler)
+    _logger.setLevel(os.environ.get("VLLM_LOGGING_LEVEL", "INFO"))
+    _logger.propagate = False
 
 
 # --- Stage 1: apply the hybrid-scheduler patch (no-op if not needed) ---
