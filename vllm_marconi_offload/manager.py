@@ -1016,7 +1016,7 @@ class SimpleCPUOffloadScheduler:
 
         gpu_block_ids: list[int] = []
         cpu_block_ids: list[int] = []
-        cpu_blocks_to_touch: list[KVCacheBlock] = []
+        cpu_blocks_l1_touched: list[KVCacheBlock] = []
         # blocks freshly promoted from L2 already
         # carry ref_cnt=1 from get_new_blocks(), so they must NOT go through
         # touch() a second time (which would leak a ref).
@@ -1060,22 +1060,32 @@ class SimpleCPUOffloadScheduler:
                         continue
                     cpu_blk = promoted
                     already_touched = True
+                else:
+                    # Touch immediately (ref_cnt 0 -> 1, unlinks from the
+                    # L1 free queue) instead of batching into a single
+                    # touch() call after this loop. A later block in this
+                    # same request can be L2-tier and trigger
+                    # _promote_l2_block_to_l1(), which runs its own nested
+                    # hoist+demote+get_new_blocks() victim search over the
+                    # L1 free queue. Until touched, an already-hit L1
+                    # block still looks free (ref_cnt==0, linked in the
+                    # queue) to that search and can be picked as an
+                    # eviction victim out from under this request -- the
+                    # same race already fixed for _promote_l2_block_to_l1's
+                    # own l2_block (see the BUGFIX comment there), just
+                    # unguarded on the batched L1 side.
+                    self.cpu_block_pool.touch([cpu_blk])
                 gpu_block_ids.append(group_gpu_ids[gpu_ext_start + i])
                 cpu_block_ids.append(cpu_blk.block_id)
                 if already_touched:
                     cpu_blocks_already_held.append(cpu_blk)
                 else:
-                    cpu_blocks_to_touch.append(cpu_blk)
-
-        # Touch L1-resident hit blocks (ref_cnt 0 -> 1). Promoted blocks
-        # already came back from get_new_blocks at ref_cnt=1, so we don't
-        # double-bump them.
-        self.cpu_block_pool.touch(cpu_blocks_to_touch)
+                    cpu_blocks_l1_touched.append(cpu_blk)
 
         # record CPU-block accesses for the eviction
         # policy so deep/hot blocks see their recency refreshed on each hit.
         if self._eviction_policy is not None:
-            for blk in cpu_blocks_to_touch:
+            for blk in cpu_blocks_l1_touched:
                 self._eviction_policy.record_access(blk.block_id)
             for blk in cpu_blocks_already_held:
                 # Promoted blocks are now L1-resident; bookkeep recency.
