@@ -38,7 +38,7 @@ import os
 
 from vllm_marconi_offload._patches import maybe_patch_hybrid_scheduler
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = [
     "SimpleCPUOffloadConnector",
     "PATCH_STATUS",
